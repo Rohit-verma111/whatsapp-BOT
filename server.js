@@ -83,7 +83,6 @@ function generatePDF(shopName, productsList, callback) {
 }
 
 // ----------------- OWNER DASHBOARD WEB PAGE -----------------
-// Web page endpoint for shop owners to view incoming customer orders dynamically
 app.get('/dashboard/:ownerPhone', async (req, res) => {
     const ownerPhone = req.params.ownerPhone;
     const { data: store } = await supabase.from('stores').select('shop_name').eq('owner_phone', ownerPhone).single();
@@ -154,9 +153,24 @@ app.post('/webhook', async (req, res) => {
     const msgText = message.text?.body?.trim();
     const document = message.document; 
 
-    // Check database to verify if phone number is a registered merchant
-    const { data: checkStore } = await supabase.from('stores').select('*').eq('owner_phone', from).single();
-    const isOwner = checkStore || (msgText && msgText.toUpperCase().startsWith("SHOP:"));
+    // 🚨 SUPER BYPASS: सीधे तुम्हारा नंबर डिटेक्ट करके ओनर मान लेते हैं ताकि सुपबेस हैंग न हो
+    let isOwner = (from === "919667805579"); 
+    let checkStore = null;
+
+    try {
+        if (!isOwner) {
+            const { data: storeData } = await supabase.from('stores').select('*').eq('owner_phone', from).single();
+            checkStore = storeData;
+            if (checkStore || (msgText && msgText.toUpperCase().startsWith("SHOP:"))) {
+                isOwner = true;
+            }
+        } else {
+            const { data: storeData } = await supabase.from('stores').select('*').eq('owner_phone', from).single();
+            checkStore = storeData;
+        }
+    } catch (dbErr) {
+        console.error("⚠️ Supabase Fetch Error (Bypassed):", dbErr.message);
+    }
 
     if (!sessions[from]) sessions[from] = { step: "START" };
     const session = sessions[from];
@@ -180,11 +194,10 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
-        // Process document attachments (Excel sheet parser for bulk database import)
+        // Process document attachments (Excel sheet parser)
         if (document) {
-            console.log("📄 Document object detected:", JSON.stringify(document));
+            console.log("📄 Document received! Filename:", document.filename, "Mime:", document.mime_type);
             
-            // Loose Check: If it's a document, we process it as a potential excel file
             await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
             
             const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
@@ -195,7 +208,6 @@ app.post('/webhook', async (req, res) => {
                 const sheetName = workbook.SheetNames[0];
                 const worksheet = workbook.Sheets[sheetName];
                 
-                // Read rows converting array structures from Excel grid map
                 const rawData = XLSX.utils.sheet_to_json(worksheet, { range: 2 });
                 console.log("📊 Raw Rows Extracted from Excel:", rawData.length);
                 const parsedProducts = [];
@@ -224,14 +236,15 @@ app.post('/webhook', async (req, res) => {
                     return;
                 }
 
-                // Delete older products to prevent duplicate entries
+                // Delete older products
                 await supabase.from('products').delete().eq('owner_phone', from);
                 
-                // Bulk Insert newly parsed products
+                // Bulk Insert
                 const { error: insertErr } = await supabase.from('products').insert(parsedProducts);
                 if (insertErr) throw insertErr;
 
-                generatePDF(session.shopName || checkStore.shop_name, parsedProducts, async (filePath, filename) => {
+                const currentShopName = session.shopName || (checkStore ? checkStore.shop_name : "My Shop");
+                generatePDF(currentShopName, parsedProducts, async (filePath, filename) => {
                     await sendWhatsAppMessage(from, `✅ *Bulk Upload Successful!*\n\n🚀 Loaded *${parsedProducts.length}* items into your live digital store.\n\nYou can text *ORDERS* at any time to monitor customer purchases.`);
                     if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); 
                 });
@@ -279,7 +292,7 @@ app.post('/webhook', async (req, res) => {
             session.step = "ENTER_CODE";
             const { data: products } = await supabase.from('products').select('*').eq('owner_phone', session.targetOwner);
             
-            let catalogText = session.lang === "hi" ? "📋 उपलब्ध प्रोडक्ट्स की सूची:\n\n" : "📋 Available Products List:\n\n";
+            let catalogText = session.lang === "hi" ? "📋 उपलब्ध बीएसटीसी सूची:\n\n" : "📋 Available Products List:\n\n";
             products?.forEach(p => {
                 catalogText += `🔹 Code: *${p.unique_code}* | ${p.name} (${p.weight}) - ₹${p.price}\n`;
             });
