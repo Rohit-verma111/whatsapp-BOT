@@ -1,9 +1,10 @@
 {
   "name": "whatsapp-shop-bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "WhatsApp Bot for Owner Product Listing and Customer Ordering",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -15,6 +16,7 @@
     "axios": "^1.18.0",
     "body-parser": "^2.3.0",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "pdfkit": "^0.14.0"
   }
 }
