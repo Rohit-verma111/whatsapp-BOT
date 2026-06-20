@@ -12,17 +12,15 @@ app.use(bodyParser.json());
 
 // ----------------- CONFIGURATIONS -----------------
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const META_TOKEN = process.env.META_ACCESS_TOKEN; // पुराना नाम सेट कर दिया
-const PHONE_ID = process.env.PHONE_NUMBER_ID;     // पुराना नाम सेट कर दिया
+const META_TOKEN = process.env.META_ACCESS_TOKEN;
+const PHONE_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// इन-मेमोरी स्टेट मैनेजमेंट (यूजर की बातचीत याद रखने के लिए)
-const userSessions = {}; 
-const ownerSession = { step: null, shopName: 'ABC', products: [] };
-
-const OWNER_NUMBER = "9667805579"; // ⚠️ यहाँ अपना (दुकानदार का) असली वॉट्सऐप नंबर डालो
+// In-memory sessions to manage user states for both owners and customers
+const sessions = {}; 
 
 // ----------------- HELPER FUNCTIONS -----------------
+// Function to send WhatsApp text messages via Meta Cloud API
 async function sendWhatsAppMessage(toNumber, textBody) {
     try {
         await axios.post(`https://graph.facebook.com/v17.0/${PHONE_ID}/messages`, {
@@ -31,17 +29,14 @@ async function sendWhatsAppMessage(toNumber, textBody) {
             type: "text",
             text: { body: textBody }
         }, {
-            headers: { 
-                'Authorization': `Bearer ${META_TOKEN}`, 
-                'Content-Type': 'application/json' 
-            }
+            headers: { 'Authorization': `Bearer ${META_TOKEN}`, 'Content-Type': 'application/json' }
         });
     } catch (err) {
         console.error("❌ Error sending message:", err.response ? err.response.data : err.message);
     }
 }
 
-// ऑटोमैटिक पीडीएफ जनरेट करने का फंक्शन
+// Function to automatically generate product catalog PDF
 function generatePDF(shopName, productsList, callback) {
     const doc = new PDFDocument();
     const filename = `catalog_${Date.now()}.pdf`;
@@ -63,181 +58,249 @@ function generatePDF(shopName, productsList, callback) {
     stream.on('finish', () => callback(filePath, filename));
 }
 
+// ----------------- OWNER DASHBOARD WEB PAGE -----------------
+// Web endpoint for owners to view their live customer orders on mobile browser
+app.get('/dashboard/:ownerPhone', async (req, res) => {
+    const ownerPhone = req.params.ownerPhone;
+    
+    // Fetch shop name and orders list from Supabase
+    const { data: store } = await supabase.from('stores').select('shop_name').eq('owner_phone', ownerPhone).single();
+    const { data: orders } = await supabase.from('orders').select('*').eq('owner_phone', ownerPhone).order('created_at', { ascending: false });
+
+    if (!store) return res.send("<h3>❌ Store not found. Please register on WhatsApp first.</h3>");
+
+    let rows = "";
+    orders?.forEach(o => {
+        rows += `
+        <tr style="border-bottom: 1px solid #ddd;">
+            <td style="padding: 12px;">+${o.customer_phone}</td>
+            <td style="padding: 12px;">${o.items.name} (${o.items.weight})</td>
+            <td style="padding: 12px;">₹${o.total_amount}</td>
+            <td style="padding: 12px;"><span style="background: #e1f5fe; color: #0288d1; padding: 4px 8px; border-radius: 4px;">${o.status}</span></td>
+            <td style="padding: 12px;">${new Date(o.created_at).toLocaleString('hi-IN')}</td>
+        </tr>`;
+    });
+
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>${store.shop_name} - Orders</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="font-family: Arial, sans-serif; margin: 20px; background: #f4f7f6;">
+        <h2 style="color: #2e7d32;">🏪 ${store.shop_name} - Live Orders</h2>
+        <p>Owner Number: +${ownerPhone}</p>
+        <div style="overflow-x:auto; background: white; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
+            <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                <tr style="background: #2e7d32; color: white;">
+                    <th style="padding: 12px;">Customer Phone</th>
+                    <th style="padding: 12px;">Product</th>
+                    <th style="padding: 12px;">Total</th>
+                    <th style="padding: 12px;">Status</th>
+                    <th style="padding: 12px;">Time</th>
+                </tr>
+                ${rows || '<tr><td colspan="5" style="padding: 20px; text-align:center;">No orders received yet.</td></tr>'}
+            </table>
+        </div>
+        <br>
+        <button onclick="window.location.reload()" style="background: #2e7d32; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">🔄 Refresh Page</button>
+    </body>
+    </html>`;
+    
+    res.send(html);
+});
+
 // ----------------- WEBHOOK VALIDATION -----------------
 app.get('/webhook', (req, res) => {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    if (mode && token === VERIFY_TOKEN) {
-        res.status(200).send(challenge);
-    } else {
-        res.sendStatus(403);
-    }
+    if (req.query['hub.mode'] && req.query['hub.verify_token'] === VERIFY_TOKEN) {
+        res.status(200).send(req.query['hub.challenge']);
+    } else { res.sendStatus(403); }
 });
 
 // ----------------- MAIN WEBHOOK LOGIC -----------------
 app.post('/webhook', async (req, res) => {
-    res.sendStatus(200); // Meta को तुरंत Response
-
+    res.sendStatus(200);
     const body = req.body;
-    if (!body.entry || !body.entry[0].changes || !body.entry[0].changes[0].value.messages) return;
+    if (!body.entry?.[0]?.changes?.[0]?.value?.messages) return;
 
     const message = body.entry[0].changes[0].value.messages[0];
     const from = message.from; 
     const msgText = message.text?.body?.trim();
-
     if (!msgText) return;
 
-    // ================= OWNER FLOW =================
-    if (from === OWNER_NUMBER) {
+    // Verify if the incoming phone number is a registered owner or attempting registration
+    const { data: checkStore } = await supabase.from('stores').select('*').eq('owner_phone', from).single();
+    const isOwner = checkStore || msgText.toUpperCase().startsWith("SHOP:");
+
+    if (!sessions[from]) sessions[from] = { step: "START" };
+    const session = sessions[from];
+
+    // ================= 🏪 MULTI-OWNER FLOW =================
+    if (isOwner) {
+        // Owner sets or updates their shop name
         if (msgText.toUpperCase().startsWith("SHOP:")) {
-            ownerSession.shopName = msgText.split(":")[1].trim();
-            ownerSession.step = "ADD_PRODUCT";
-            ownerSession.products = [];
-            await sendWhatsAppMessage(OWNER_NUMBER, `🏪 शॉप का नाम "${ownerSession.shopName}" सेट हो गया है।\n\nअब पहले प्रोडक्ट की डिटेल इस फॉर्मेट में भेजें:\n*नाम, वजन, कीमत*\n\n(उदाहरण: आलू, 5kg, 120)`);
+            const shopName = msgText.split(":")[1].trim();
+            await supabase.from('stores').upsert({ owner_phone: from, shop_name: shopName });
+            session.step = "ASK_PRODUCT_NAME";
+            session.products = [];
+            session.shopName = shopName;
+            await sendWhatsAppMessage(from, `🏪 Your shop *"${shopName}"* has been registered successfully!\n\nTo build your product catalog, please send the **Name** of your first product:`);
             return;
         }
 
-        if (ownerSession.step === "ADD_PRODUCT") {
-            if (msgText.toUpperCase() === "DONE") {
-                if (ownerSession.products.length === 0) {
-                    await sendWhatsAppMessage(OWNER_NUMBER, "❌ कम से कम एक प्रोडक्ट तो जोड़ो भाई!");
-                    return;
-                }
-                
-                generatePDF(ownerSession.shopName, ownerSession.products, async (filePath, filename) => {
-                    await sendWhatsAppMessage(OWNER_NUMBER, `✅ कैटलॉग ऑटोमेशन से तैयार है! कुल ${ownerSession.products.length} प्रोडक्ट्स लिस्ट हो गए हैं और डेटाबेस में सुरक्षित सेव हो चुके हैं। अब कस्टमर्स ऑर्डर कर सकते हैं।`);
-                    ownerSession.step = null;
-                });
+        // Owner requests their live dashboard tracking link
+        if (msgText.toUpperCase() === "ORDERS" || msgText === "ऑर्डर") {
+            const dashboardLink = `https://${req.headers.host}/dashboard/${from}`;
+            await sendWhatsAppMessage(from, `📋 To view all live incoming orders for your store, open this link on your phone:\n\n🔗 ${dashboardLink}`);
+            return;
+        }
+
+        // Handle product name input
+        if (session.step === "ASK_PRODUCT_NAME") {
+            session.currentProduct = { name: msgText };
+            session.step = "ASK_PRODUCT_WEIGHT";
+            await sendWhatsAppMessage(from, `⚖️ Product name is set to "${msgText}". Now send its **Weight/Quantity** (e.g., 1kg, 500g, 1 Packet):`);
+            return;
+        }
+
+        // Handle product weight input
+        if (session.step === "ASK_PRODUCT_WEIGHT") {
+            session.currentProduct.weight = msgText;
+            session.step = "ASK_PRODUCT_PRICE";
+            await sendWhatsAppMessage(from, `💰 Weight is set to "${msgText}". Now enter its **Price** using numbers only (e.g., 150):`);
+            return;
+        }
+
+        // Handle product price input and insert into database
+        if (session.step === "ASK_PRODUCT_PRICE") {
+            const priceNum = parseFloat(msgText);
+            if (isNaN(priceNum)) {
+                await sendWhatsAppMessage(from, "❌ Invalid input. Please enter the price in numbers only. Try again:");
                 return;
             }
+            session.currentProduct.price = priceNum;
+            const uniqueCode = "PROD" + Math.floor(1000 + Math.random() * 9000);
 
-            const parts = msgText.split(",");
-            if (parts.length === 3) {
-                const uniqueCode = "PROD" + Math.floor(1000 + Math.random() * 9000);
-                const newProd = {
-                    unique_code: uniqueCode,
-                    name: parts[0].trim(),
-                    weight: parts[1].trim(),
-                    price: parseFloat(parts[2].trim())
-                };
+            const finalProduct = {
+                owner_phone: from,
+                unique_code: uniqueCode,
+                name: session.currentProduct.name,
+                weight: session.currentProduct.weight,
+                price: session.currentProduct.price
+            };
 
-                // Supabase में सेव करें
-                await supabase.from('products').insert([newProd]);
-                ownerSession.products.push(newProd);
+            await supabase.from('products').insert([finalProduct]);
+            session.products.push(finalProduct);
 
-                await sendWhatsAppMessage(OWNER_NUMBER, `📥 जोड़ा गया: ${newProd.name} (${uniqueCode})\n\nअगला प्रोडक्ट भेजें या लिस्ट पूरी होने पर *DONE* लिखकर भेजें।`);
-            } else {
-                await sendWhatsAppMessage(OWNER_NUMBER, "❌ गलत फॉर्मेट! कृपया इस तरह भेजें: नाम, वजन, कीमत");
+            session.step = "ASK_NEXT_OR_DONE";
+            await sendWhatsAppMessage(from, `📥 *Product Added Successfully!*\n🔹 Code: ${uniqueCode}\n🔹 Name: ${finalProduct.name}\n🔹 Weight: ${finalProduct.weight}\n🔹 Price: ₹${finalProduct.price}\n\nWhat would you like to do next?\nReply *1* - To add another product\nReply *DONE* - To finish listing and generate PDF catalog\nReply *ORDERS* - To view your dashboard`);
+            return;
+        }
+
+        // Check whether owner wants to add more items or finish configuration
+        if (session.step === "ASK_NEXT_OR_DONE") {
+            if (msgText === "1") {
+                session.step = "ASK_PRODUCT_NAME";
+                await sendWhatsAppMessage(from, "📦 Please send the **Name** of the next product:");
+            } else if (msgText.toUpperCase() === "DONE") {
+                generatePDF(session.shopName || checkStore.shop_name, session.products, async (filePath, filename) => {
+                    await sendWhatsAppMessage(from, `✅ Digital catalog is ready! All products are securely saved.\n\nYou can text *ORDERS* at any time to track incoming customer purchases.`);
+                    session.step = "OWNER_IDLE";
+                });
             }
             return;
         }
+        return;
     }
 
-    // ================= CUSTOMER FLOW =================
-    if (!userSessions[from]) {
-        userSessions[from] = { step: "LANG_SELECT" };
+    // ================= 👤 CUSTOMER FLOW =================
+    // Customer initiates chat session
+    if (session.step === "START") {
+        session.step = "LANG_SELECT";
         await sendWhatsAppMessage(from, "👋 Welcome! Please select your language / कृपया अपनी भाषा चुनें:\n\n1. English\n2. Hindi (हिंदी)");
         return;
     }
 
-    const session = userSessions[from];
-
-    // 1. भाषा का चुनाव
+    // Capture customer language selection
     if (session.step === "LANG_SELECT") {
-        if (msgText === "1") {
-            session.lang = "en";
-            session.step = "MAIN_MENU";
-            await sendWhatsAppMessage(from, "English selected.\n\nType *1* to Buy\nType *2* for Return/Exchange");
-        } else if (msgText === "2") {
-            session.lang = "hi";
-            session.step = "MAIN_MENU";
-            await sendWhatsAppMessage(from, "हिंदी चुनी गई है।\n\nखरीदने के लिए *1* भेजें\nरिटर्न/एक्सचेंज के लिए *2* भेजें");
-        } else {
-            await sendWhatsAppMessage(from, "❌ Invalid Option. Please reply with 1 or 2.");
-        }
+        session.lang = msgText === "2" ? "hi" : "en";
+        session.step = "ENTER_OWNER_SHOP";
+        const msg = session.lang === "hi" ? "🏪 कृपया उस दुकानदार का मोबाइल नंबर डालें जिससे आप सामान खरीदना चाहते हैं (बिना + के, जैसे: 919876543210):" : "🏪 Please enter the Shop Owner's mobile number you want to buy from (e.g., 919876543210):";
+        await sendWhatsAppMessage(from, msg);
         return;
     }
 
-    // 2. मुख्य मेनू (Buy / Return)
+    // Verify shop owner existence for standard multi-tenant testing configuration
+    if (session.step === "ENTER_OWNER_SHOP") {
+        const { data: store } = await supabase.from('stores').select('*').eq('owner_phone', msgText).single();
+        if (!store) {
+            await sendWhatsAppMessage(from, "❌ This shop is not registered in our system. Please enter a valid owner phone number:");
+            return;
+        }
+        session.targetOwner = msgText;
+        session.step = "MAIN_MENU";
+        const menuMsg = session.lang === "hi" ? `🏪 आप *"${store.shop_name}"* से जुड़े हैं।\n\nखरीदने के लिए *1* भेजें\nरिटर्न/एक्सचेंज के लिए *2* भेजें` : `🏪 You are connected to *"${store.shop_name}"*.\n\nReply *1* to Buy\nReply *2* for Return/Exchange`;
+        await sendWhatsAppMessage(from, menuMsg);
+        return;
+    }
+
+    // Handle Buy or Return navigation choice
     if (session.step === "MAIN_MENU") {
         if (msgText === "1") {
             session.step = "ENTER_CODE";
+            const { data: products } = await supabase.from('products').select('*').eq('owner_phone', session.targetOwner);
             
-            // डेटाबेस से सारे प्रोडक्ट्स निकालना
-            const { data: products } = await supabase.from('products').select('*');
-            let catalogText = session.lang === "hi" ? "📋 उपलब्ध प्रोडक्ट्स की सूची (PDF जनरेटेड):\n\n" : "📋 Available Products List (PDF Generated):\n\n";
-            
-            if(!products || products.length === 0) {
-                catalogText += session.lang === "hi" ? "अभी कोई प्रोडक्ट उपलब्ध नहीं है।" : "No products available right now.";
-                await sendWhatsAppMessage(from, catalogText);
-                return;
-            }
-
-            products.forEach(p => {
+            let catalogText = session.lang === "hi" ? "📋 उपलब्ध प्रोडक्ट्स की सूची:\n\n" : "📋 Available Products List:\n\n";
+            products?.forEach(p => {
                 catalogText += `🔹 Code: *${p.unique_code}* | ${p.name} (${p.weight}) - ₹${p.price}\n`;
             });
-
-            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो प्रोडक्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product you want to buy.";
+            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो प्रोडक्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
             await sendWhatsAppMessage(from, catalogText);
-        } else if (msgText === "2") {
-            const returnMsg = session.lang === "hi" ? "🔄 हमारे ओनर जल्द ही रिटर्न/एक्सचेंज के लिए आपसे संपर्क करेंगे।" : "🔄 Our owner will contact you shortly regarding Return/Exchange.";
-            await sendWhatsAppMessage(from, returnMsg);
-            delete userSessions[from];
         } else {
-            await sendWhatsAppMessage(from, session.lang === "hi" ? "❌ कृपया 1 या 2 दबाएं।" : "❌ Please reply with 1 or 2.");
+            await sendWhatsAppMessage(from, session.lang === "hi" ? "🔄 ओनर आपसे जल्द संपर्क करेंगे।" : "🔄 Owner will contact you soon.");
+            delete sessions[from];
         }
         return;
     }
 
-    // 3. प्रोडक्ट का यूनिक कोड डालना
+    // Match unique product code submitted by the customer
     if (session.step === "ENTER_CODE") {
-        const { data: product } = await supabase.from('products').select('*').eq('unique_code', msgText.toUpperCase()).single();
-
+        const { data: product } = await supabase.from('products').select('*').eq('owner_phone', session.targetOwner).eq('unique_code', msgText.toUpperCase()).single();
         if (product) {
             session.pendingOrder = product;
             session.step = "CONFIRM_ORDER";
-
             let confText = session.lang === "hi" ? 
-                `🧐 *ऑर्डर की पुष्टि करें:*\n\n📦 नाम: ${product.name}\n⚖️ वजन: ${product.weight}\n💰 कीमत: ₹${product.price}\n\nटोटल अमाउंट: *₹${product.price}*\n\nऑर्डर फाइनल करने के लिए *YES* लिखें, कैंसिल करने के लिए *NO* लिखें।` :
-                `🧐 *Confirm Your Order:*\n\n📦 Name: ${product.name}\n⚖️ Weight: ${product.weight}\n💰 Price: ₹${product.price}\n\nTotal Amount: *₹${product.price}*\n\nReply *YES* to confirm, *NO* to cancel.`;
-
+                `🧐 *ऑर्डर की पुष्टि करें:*\n\n📦 नाम: ${product.name}\n⚖️ वजन: ${product.weight}\n💰 कीमत: ₹${product.price}\n\nटोटल अमाउंट: *₹${product.price}*\n\nऑर्डर फाइनल करने के लिए *YES* लिखें, कैंसिल के लिए *NO* लिखें.` :
+                `🧐 *Confirm Order:*\n\n📦 Name: ${product.name}\n⚖️ Weight: ${product.weight}\n💰 Price: ₹${product.price}\n\nTotal: *₹${product.price}*\n\nReply *YES* to confirm, *NO* to cancel.`;
             await sendWhatsAppMessage(from, confText);
         } else {
-            await sendWhatsAppMessage(from, session.lang === "hi" ? "❌ गलत कोड! कृपया सही प्रोडक्ट कोड दोबारा डालें।" : "❌ Invalid code! Please enter a valid product code.");
+            await sendWhatsAppMessage(from, "❌ Invalid Code!");
         }
         return;
     }
 
-    // 4. ऑर्डर कन्फर्मेशन और ओनर नोटिफिकेशन
+    // Save finalized order logs and send direct confirmation to customer & merchant
     if (session.step === "CONFIRM_ORDER") {
         if (msgText.toUpperCase() === "YES") {
-            const orderItem = session.pendingOrder;
-
-            // डेटाबेस में ऑर्डर सेव करें
+            const item = session.pendingOrder;
+            
             await supabase.from('orders').insert([{
+                owner_phone: session.targetOwner,
                 customer_phone: from,
-                items: orderItem,
-                total_amount: orderItem.price
+                items: item,
+                total_amount: item.price
             }]);
 
-            // कस्टमर को मैसेज
-            await sendWhatsAppMessage(from, session.lang === "hi" ? "🎉 आपका ऑर्डर सफलतापूर्वक प्लेस हो गया है! धन्यवाद।" : "🎉 Your order has been successfully placed! Thank you.");
-
-            // ओनर को तुरंत अलर्ट भेजना
-            const ownerNotification = `🚨 *नया ऑर्डर आया है!* 🚨\n\n👤 कस्टमर नंबर: +${from}\n📦 प्रोडक्ट: ${orderItem.name}\n⚖️ वजन: ${orderItem.weight}\n💰 कुल कीमत: ₹${orderItem.price}`;
-            await sendWhatsAppMessage(OWNER_NUMBER, ownerNotification);
-
-            delete userSessions[from];
-        } else {
-            await sendWhatsAppMessage(from, session.lang === "hi" ? "❌ ऑर्डर कैंसिल कर दिया गया है। शुरू करने के लिए कुछ भी लिखकर भेजें।" : "❌ Order cancelled. Type anything to start again.");
-            delete userSessions[from];
+            await sendWhatsAppMessage(from, session.lang === "hi" ? "🎉 आपका ऑर्डर प्लेस हो गया है!" : "🎉 Order placed successfully!");
+            
+            const ownerAlert = `🚨 *New Order Received!* 🚨\n\n👤 Customer: +${from}\n📦 Product: ${item.name}\n💰 Price: ₹${item.price}\n\n📱 To look at all incoming orders, reply with *ORDERS*.`;
+            await sendWhatsAppMessage(session.targetOwner, ownerAlert);
         }
+        delete sessions[from];
         return;
     }
 });
 
-// ----------------- START SERVER -----------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Secure Bot Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Multi-Tenant Server running on port ${PORT}`));
