@@ -36,21 +36,12 @@ async function sendWhatsAppMessage(toNumber, textBody) {
     }
 }
 
-// 🛠️ FIX: Bulletproof Meta Media Download Function
-async function downloadWhatsAppMedia(mediaId, localPath) {
+// 🛠️ ULTIMATE FIX: Direct URL Media Download Function (No manual paths)
+async function downloadWhatsAppMedia(mediaUrl, localPath) {
     try {
-        // 1. सबसे पहले मेटा से फाइल का असली डाउनलोड URL लाते हैं (वर्जन v20.0 के साथ)
-        const resUrl = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, {
-            headers: { 'Authorization': `Bearer ${META_TOKEN}` }
-        });
-        
-        const downloadUrl = resUrl.data.url;
-        if (!downloadUrl) throw new Error("Could not retrieve download URL from Meta.");
-
-        // 2. उस URL का उपयोग करके फाइल को डाउनलोड करते हैं
         const response = await axios({
             method: 'GET',
-            url: downloadUrl,
+            url: mediaUrl,
             responseType: 'stream',
             headers: { 'Authorization': `Bearer ${META_TOKEN}` }
         });
@@ -205,8 +196,8 @@ app.post('/webhook', async (req, res) => {
             const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
             
             try {
-                // Download file via new url pattern
-                await downloadWhatsAppMedia(document.id, tempFilePath);
+                // 🛠️ FIX: पासिंग द डायरेक्ट यूआरएल फ्रॉम मेटा वेबहुक पेलोड
+                await downloadWhatsAppMedia(document.url, tempFilePath);
 
                 const workbook = XLSX.readFile(tempFilePath);
                 const sheetName = workbook.SheetNames[0];
