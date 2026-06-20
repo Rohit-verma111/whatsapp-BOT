@@ -143,6 +143,10 @@ app.get('/webhook', (req, res) => {
 app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
     const body = req.body;
+
+    // 🚨 DEBUG LINE: This prints every incoming payload from Meta to Render logs
+    console.log("📥 Raw Webhook Received:", JSON.stringify(body));
+
     if (!body.entry?.[0]?.changes?.[0]?.value?.messages) return;
 
     const message = body.entry[0].changes[0].value.messages[0];
@@ -177,57 +181,61 @@ app.post('/webhook', async (req, res) => {
         }
 
         // Process document attachments (Excel sheet parser for bulk database import)
-        if (document && (document.mime_type.includes("sheet") || document.filename.endsWith(".xlsx"))) {
-            await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
+        if (document) {
+            console.log("📄 Document object detected:", JSON.stringify(document));
             
-            const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
-            await downloadWhatsAppMedia(document.id, tempFilePath);
-
-            try {
-                const workbook = XLSX.readFile(tempFilePath);
-                const sheetName = workbook.SheetNames[0];
-                const worksheet = workbook.Sheets[sheetName];
+            if (document.filename.endsWith(".xlsx") || document.mime_type.includes("sheet") || document.mime_type.includes("excel")) {
+                await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
                 
-                // Read rows converting array structures from Excel grid map
-                const rawData = XLSX.utils.sheet_to_json(worksheet, { range: 2 });
-                const parsedProducts = [];
+                const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
+                await downloadWhatsAppMedia(document.id, tempFilePath);
 
-                rawData.forEach(row => {
-                    const uniqueCode = row['Unique Code'] || Object.values(row)[0];
-                    const pName = row['Product Name'] || Object.values(row)[1];
-                    const weight = row['Weight/Quantity'] || Object.values(row)[2];
-                    const price = parseFloat(row['Price (₹)'] || Object.values(row)[3]);
+                try {
+                    const workbook = XLSX.readFile(tempFilePath);
+                    const sheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[sheetName];
+                    
+                    const rawData = XLSX.utils.sheet_to_json(worksheet, { range: 2 });
+                    const parsedProducts = [];
 
-                    if (uniqueCode && pName && price) {
-                        parsedProducts.push({
-                            owner_phone: from,
-                            unique_code: String(uniqueCode).trim().toUpperCase(),
-                            name: String(pName).trim(),
-                            weight: String(weight || "N/A").trim(),
-                            price: price
-                        });
+                    rawData.forEach(row => {
+                        const uniqueCode = row['Unique Code'] || Object.values(row)[0];
+                        const pName = row['Product Name'] || Object.values(row)[1];
+                        const weight = row['Weight/Quantity'] || Object.values(row)[2];
+                        const price = parseFloat(row['Price (₹)'] || Object.values(row)[3]);
+
+                        if (uniqueCode && pName && price) {
+                            parsedProducts.push({
+                                owner_phone: from,
+                                unique_code: String(uniqueCode).trim().toUpperCase(),
+                                name: String(pName).trim(),
+                                weight: String(weight || "N/A").trim(),
+                                price: price
+                            });
+                        }
+                    });
+
+                    if (parsedProducts.length === 0) {
+                        await sendWhatsAppMessage(from, "❌ Excel parsing failed. No valid products found inside the template formatting.");
+                        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+                        return;
                     }
-                });
 
-                if (parsedProducts.length === 0) {
-                    await sendWhatsAppMessage(from, "❌ Excel parsing failed. No valid products found inside the template formatting.");
-                    return;
+                    await supabase.from('products').delete().eq('owner_phone', from);
+                    await supabase.from('products').insert(parsedProducts);
+
+                    generatePDF(session.shopName || checkStore.shop_name, parsedProducts, async (filePath, filename) => {
+                        await sendWhatsAppMessage(from, `✅ *Bulk Upload Successful!*\n\n🚀 Loaded *${parsedProducts.length}* items into your live digital store.\n\nYou can text *ORDERS* at any time to monitor customer purchases.`);
+                        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); 
+                    });
+
+                } catch (excelErr) {
+                    console.error("Excel Error:", excelErr);
+                    await sendWhatsAppMessage(from, "❌ Processing Error. Please verify your Excel structure follows the proper template layout.");
+                    if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
                 }
-
-                // Flush old records to overwrite updated catalog sheets cleanly
-                await supabase.from('products').delete().eq('owner_phone', from);
-                
-                // Direct bulk array insert query execution via Supabase client
-                await supabase.from('products').insert(parsedProducts);
-
-                generatePDF(session.shopName || checkStore.shop_name, parsedProducts, async (filePath, filename) => {
-                    await sendWhatsAppMessage(from, `✅ *Bulk Upload Successful!*\n\n🚀 Loaded *${parsedProducts.length}* items into your live digital store.\n\nYou can text *ORDERS* at any time to monitor customer purchases.`);
-                    if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); 
-                });
-
-            } catch (excelErr) {
-                console.error("Excel Error:", excelErr);
-                await sendWhatsAppMessage(from, "❌ Processing Error. Please verify your Excel structure follows the proper template layout.");
+            } else {
+                await sendWhatsAppMessage(from, "❌ Unsupported file format! Please send a valid Excel (.xlsx) file.");
             }
             return;
         }
@@ -235,14 +243,12 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ================= 👤 CONSUMER END-USER FLOW =================
-    // Initialize standard user chat welcome routing state
     if (session.step === "START") {
         session.step = "LANG_SELECT";
         await sendWhatsAppMessage(from, "👋 Welcome! Please select your language / कृपया अपनी भाषा चुनें:\n\n1. English\n2. Hindi (हिंदी)");
         return;
     }
 
-    // Save internal communication language setting flags
     if (session.step === "LANG_SELECT") {
         session.lang = msgText === "2" ? "hi" : "en";
         session.step = "ENTER_OWNER_SHOP";
@@ -251,7 +257,6 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Route consumer to targeted merchant marketplace via custom mobile search
     if (session.step === "ENTER_OWNER_SHOP") {
         const { data: store } = await supabase.from('stores').select('*').eq('owner_phone', msgText).single();
         if (!store) {
@@ -265,7 +270,6 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Dynamic catalog generator mapping query
     if (session.step === "MAIN_MENU") {
         if (msgText === "1") {
             session.step = "ENTER_CODE";
@@ -275,7 +279,7 @@ app.post('/webhook', async (req, res) => {
             products?.forEach(p => {
                 catalogText += `🔹 Code: *${p.unique_code}* | ${p.name} (${p.weight}) - ₹${p.price}\n`;
             });
-            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो破解 खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
+            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो प्रोडक्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
             await sendWhatsAppMessage(from, catalogText);
         } else {
             await sendWhatsAppMessage(from, session.lang === "hi" ? "🔄 ओनर आपसे जल्द संपर्क करेंगे।" : "🔄 Owner will contact you soon.");
@@ -284,7 +288,6 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Check unique key values assigned to single product objects
     if (session.step === "ENTER_CODE") {
         const { data: product } = await supabase.from('products').select('*').eq('owner_phone', session.targetOwner).eq('unique_code', msgText.toUpperCase()).single();
         if (product) {
@@ -300,7 +303,6 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Save checkout pipeline states to order rows and shoot alert messages to merchant
     if (session.step === "CONFIRM_ORDER") {
         if (msgText && msgText.toUpperCase() === "YES") {
             const item = session.pendingOrder;
