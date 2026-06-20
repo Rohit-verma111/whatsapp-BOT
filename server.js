@@ -6,6 +6,7 @@ const { createClient } = require('@supabase/supabase-js');
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
+const XLSX = require('xlsx');
 
 const app = express();
 app.use(bodyParser.json());
@@ -16,7 +17,6 @@ const META_TOKEN = process.env.META_ACCESS_TOKEN;
 const PHONE_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// In-memory sessions to manage user states for both owners and customers
 const sessions = {}; 
 
 // ----------------- HELPER FUNCTIONS -----------------
@@ -36,6 +36,30 @@ async function sendWhatsAppMessage(toNumber, textBody) {
     }
 }
 
+// Function to download incoming media files from Meta servers
+async function downloadWhatsAppMedia(mediaId, localPath) {
+    try {
+        const resUrl = await axios.get(`https://graph.facebook.com/v17.0/${mediaId}`, {
+            headers: { 'Authorization': `Bearer ${META_TOKEN}` }
+        });
+        const downloadUrl = resUrl.data.url;
+        const response = await axios({
+            method: 'GET',
+            url: downloadUrl,
+            responseType: 'stream',
+            headers: { 'Authorization': `Bearer ${META_TOKEN}` }
+        });
+        return new Promise((resolve, reject) => {
+            const writer = fs.createWriteStream(localPath);
+            response.data.pipe(writer);
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+    } catch (err) {
+        console.error("❌ Failed downloading media:", err.message);
+    }
+}
+
 // Function to automatically generate product catalog PDF
 function generatePDF(shopName, productsList, callback) {
     const doc = new PDFDocument();
@@ -46,11 +70,11 @@ function generatePDF(shopName, productsList, callback) {
     doc.pipe(stream);
     doc.fontSize(24).text(shopName, { align: 'center' });
     doc.moveDown();
-    doc.fontSize(14).text("Product Catalog / प्रोडक्ट सूची", { align: 'center' });
+    doc.fontSize(14).text("Product Catalog", { align: 'center' });
     doc.moveDown();
 
     productsList.forEach(p => {
-        doc.fontSize(12).text(`Code: ${p.unique_code} | Name: ${p.name} | Weight: ${p.weight} | Price: ₹${p.price}`);
+        doc.fontSize(12).text(`Code: ${p.unique_code} | Name: ${p.name} | Weight: ${p.weight} | Price: INR ${p.price}`);
         doc.moveDown(0.5);
     });
 
@@ -59,11 +83,9 @@ function generatePDF(shopName, productsList, callback) {
 }
 
 // ----------------- OWNER DASHBOARD WEB PAGE -----------------
-// Web endpoint for owners to view their live customer orders on mobile browser
+// Web page endpoint for shop owners to view incoming customer orders dynamically
 app.get('/dashboard/:ownerPhone', async (req, res) => {
     const ownerPhone = req.params.ownerPhone;
-    
-    // Fetch shop name and orders list from Supabase
     const { data: store } = await supabase.from('stores').select('shop_name').eq('owner_phone', ownerPhone).single();
     const { data: orders } = await supabase.from('orders').select('*').eq('owner_phone', ownerPhone).order('created_at', { ascending: false });
 
@@ -77,7 +99,7 @@ app.get('/dashboard/:ownerPhone', async (req, res) => {
             <td style="padding: 12px;">${o.items.name} (${o.items.weight})</td>
             <td style="padding: 12px;">₹${o.total_amount}</td>
             <td style="padding: 12px;"><span style="background: #e1f5fe; color: #0288d1; padding: 4px 8px; border-radius: 4px;">${o.status}</span></td>
-            <td style="padding: 12px;">${new Date(o.created_at).toLocaleString('hi-IN')}</td>
+            <td style="padding: 12px;">${new Date(o.created_at).toLocaleString('en-IN')}</td>
         </tr>`;
     });
 
@@ -107,7 +129,6 @@ app.get('/dashboard/:ownerPhone', async (req, res) => {
         <button onclick="window.location.reload()" style="background: #2e7d32; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">🔄 Refresh Page</button>
     </body>
     </html>`;
-    
     res.send(html);
 });
 
@@ -127,102 +148,101 @@ app.post('/webhook', async (req, res) => {
     const message = body.entry[0].changes[0].value.messages[0];
     const from = message.from; 
     const msgText = message.text?.body?.trim();
-    if (!msgText) return;
+    const document = message.document; 
 
-    // Verify if the incoming phone number is a registered owner or attempting registration
+    // Check database to verify if phone number is a registered merchant
     const { data: checkStore } = await supabase.from('stores').select('*').eq('owner_phone', from).single();
-    const isOwner = checkStore || msgText.toUpperCase().startsWith("SHOP:");
+    const isOwner = checkStore || (msgText && msgText.toUpperCase().startsWith("SHOP:"));
 
     if (!sessions[from]) sessions[from] = { step: "START" };
     const session = sessions[from];
 
-    // ================= 🏪 MULTI-OWNER FLOW =================
+    // ================= 🏪 MULTI-OWNER MERCHANT FLOW =================
     if (isOwner) {
-        // Owner sets or updates their shop name
-        if (msgText.toUpperCase().startsWith("SHOP:")) {
+        // Handle new shop registration command
+        if (msgText && msgText.toUpperCase().startsWith("SHOP:")) {
             const shopName = msgText.split(":")[1].trim();
             await supabase.from('stores').upsert({ owner_phone: from, shop_name: shopName });
-            session.step = "ASK_PRODUCT_NAME";
-            session.products = [];
+            session.step = "AWAITING_CATALOG";
             session.shopName = shopName;
-            await sendWhatsAppMessage(from, `🏪 Your shop *"${shopName}"* has been registered successfully!\n\nTo build your product catalog, please send the **Name** of your first product:`);
+            await sendWhatsAppMessage(from, `🏪 Your shop *"${shopName}"* has been registered!\n\n📊 *BULK UPLOAD ENABLED:* Please upload/send your product catalog Excel file (.xlsx) directly to this chat.\n\nMake sure the file columns match exactly: Unique Code, Product Name, Weight/Quantity, Price.`);
             return;
         }
 
-        // Owner requests their live dashboard tracking link
-        if (msgText.toUpperCase() === "ORDERS" || msgText === "ऑर्डर") {
+        // Handle dashboard view link requested by merchant
+        if (msgText && (msgText.toUpperCase() === "ORDERS" || msgText === "ऑर्डर")) {
             const dashboardLink = `https://${req.headers.host}/dashboard/${from}`;
             await sendWhatsAppMessage(from, `📋 To view all live incoming orders for your store, open this link on your phone:\n\n🔗 ${dashboardLink}`);
             return;
         }
 
-        // Handle product name input
-        if (session.step === "ASK_PRODUCT_NAME") {
-            session.currentProduct = { name: msgText };
-            session.step = "ASK_PRODUCT_WEIGHT";
-            await sendWhatsAppMessage(from, `⚖️ Product name is set to "${msgText}". Now send its **Weight/Quantity** (e.g., 1kg, 500g, 1 Packet):`);
-            return;
-        }
+        // Process document attachments (Excel sheet parser for bulk database import)
+        if (document && (document.mime_type.includes("sheet") || document.filename.endsWith(".xlsx"))) {
+            await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
+            
+            const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
+            await downloadWhatsAppMedia(document.id, tempFilePath);
 
-        // Handle product weight input
-        if (session.step === "ASK_PRODUCT_WEIGHT") {
-            session.currentProduct.weight = msgText;
-            session.step = "ASK_PRODUCT_PRICE";
-            await sendWhatsAppMessage(from, `💰 Weight is set to "${msgText}". Now enter its **Price** using numbers only (e.g., 150):`);
-            return;
-        }
+            try {
+                const workbook = XLSX.readFile(tempFilePath);
+                const sheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[sheetName];
+                
+                // Read rows converting array structures from Excel grid map
+                const rawData = XLSX.utils.sheet_to_json(worksheet, { range: 2 });
+                const parsedProducts = [];
 
-        // Handle product price input and insert into database
-        if (session.step === "ASK_PRODUCT_PRICE") {
-            const priceNum = parseFloat(msgText);
-            if (isNaN(priceNum)) {
-                await sendWhatsAppMessage(from, "❌ Invalid input. Please enter the price in numbers only. Try again:");
-                return;
-            }
-            session.currentProduct.price = priceNum;
-            const uniqueCode = "PROD" + Math.floor(1000 + Math.random() * 9000);
+                rawData.forEach(row => {
+                    const uniqueCode = row['Unique Code'] || Object.values(row)[0];
+                    const pName = row['Product Name'] || Object.values(row)[1];
+                    const weight = row['Weight/Quantity'] || Object.values(row)[2];
+                    const price = parseFloat(row['Price (₹)'] || Object.values(row)[3]);
 
-            const finalProduct = {
-                owner_phone: from,
-                unique_code: uniqueCode,
-                name: session.currentProduct.name,
-                weight: session.currentProduct.weight,
-                price: session.currentProduct.price
-            };
-
-            await supabase.from('products').insert([finalProduct]);
-            session.products.push(finalProduct);
-
-            session.step = "ASK_NEXT_OR_DONE";
-            await sendWhatsAppMessage(from, `📥 *Product Added Successfully!*\n🔹 Code: ${uniqueCode}\n🔹 Name: ${finalProduct.name}\n🔹 Weight: ${finalProduct.weight}\n🔹 Price: ₹${finalProduct.price}\n\nWhat would you like to do next?\nReply *1* - To add another product\nReply *DONE* - To finish listing and generate PDF catalog\nReply *ORDERS* - To view your dashboard`);
-            return;
-        }
-
-        // Check whether owner wants to add more items or finish configuration
-        if (session.step === "ASK_NEXT_OR_DONE") {
-            if (msgText === "1") {
-                session.step = "ASK_PRODUCT_NAME";
-                await sendWhatsAppMessage(from, "📦 Please send the **Name** of the next product:");
-            } else if (msgText.toUpperCase() === "DONE") {
-                generatePDF(session.shopName || checkStore.shop_name, session.products, async (filePath, filename) => {
-                    await sendWhatsAppMessage(from, `✅ Digital catalog is ready! All products are securely saved.\n\nYou can text *ORDERS* at any time to track incoming customer purchases.`);
-                    session.step = "OWNER_IDLE";
+                    if (uniqueCode && pName && price) {
+                        parsedProducts.push({
+                            owner_phone: from,
+                            unique_code: String(uniqueCode).trim().toUpperCase(),
+                            name: String(pName).trim(),
+                            weight: String(weight || "N/A").trim(),
+                            price: price
+                        });
+                    }
                 });
+
+                if (parsedProducts.length === 0) {
+                    await sendWhatsAppMessage(from, "❌ Excel parsing failed. No valid products found inside the template formatting.");
+                    return;
+                }
+
+                // Flush old records to overwrite updated catalog sheets cleanly
+                await supabase.from('products').delete().eq('owner_phone', from);
+                
+                // Direct bulk array insert query execution via Supabase client
+                await supabase.from('products').insert(parsedProducts);
+
+                generatePDF(session.shopName || checkStore.shop_name, parsedProducts, async (filePath, filename) => {
+                    await sendWhatsAppMessage(from, `✅ *Bulk Upload Successful!*\n\n🚀 Loaded *${parsedProducts.length}* items into your live digital store.\n\nYou can text *ORDERS* at any time to monitor customer purchases.`);
+                    if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); 
+                });
+
+            } catch (excelErr) {
+                console.error("Excel Error:", excelErr);
+                await sendWhatsAppMessage(from, "❌ Processing Error. Please verify your Excel structure follows the proper template layout.");
             }
             return;
         }
         return;
     }
 
-    // ================= 👤 CUSTOMER FLOW =================
-    // Customer initiates chat session
+    // ================= 👤 CONSUMER END-USER FLOW =================
+    // Initialize standard user chat welcome routing state
     if (session.step === "START") {
         session.step = "LANG_SELECT";
         await sendWhatsAppMessage(from, "👋 Welcome! Please select your language / कृपया अपनी भाषा चुनें:\n\n1. English\n2. Hindi (हिंदी)");
         return;
     }
 
-    // Capture customer language selection
+    // Save internal communication language setting flags
     if (session.step === "LANG_SELECT") {
         session.lang = msgText === "2" ? "hi" : "en";
         session.step = "ENTER_OWNER_SHOP";
@@ -231,7 +251,7 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Verify shop owner existence for standard multi-tenant testing configuration
+    // Route consumer to targeted merchant marketplace via custom mobile search
     if (session.step === "ENTER_OWNER_SHOP") {
         const { data: store } = await supabase.from('stores').select('*').eq('owner_phone', msgText).single();
         if (!store) {
@@ -245,7 +265,7 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Handle Buy or Return navigation choice
+    // Dynamic catalog generator mapping query
     if (session.step === "MAIN_MENU") {
         if (msgText === "1") {
             session.step = "ENTER_CODE";
@@ -255,7 +275,7 @@ app.post('/webhook', async (req, res) => {
             products?.forEach(p => {
                 catalogText += `🔹 Code: *${p.unique_code}* | ${p.name} (${p.weight}) - ₹${p.price}\n`;
             });
-            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो प्रोडक्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
+            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो破解 खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
             await sendWhatsAppMessage(from, catalogText);
         } else {
             await sendWhatsAppMessage(from, session.lang === "hi" ? "🔄 ओनर आपसे जल्द संपर्क करेंगे।" : "🔄 Owner will contact you soon.");
@@ -264,7 +284,7 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Match unique product code submitted by the customer
+    // Check unique key values assigned to single product objects
     if (session.step === "ENTER_CODE") {
         const { data: product } = await supabase.from('products').select('*').eq('owner_phone', session.targetOwner).eq('unique_code', msgText.toUpperCase()).single();
         if (product) {
@@ -280,18 +300,16 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Save finalized order logs and send direct confirmation to customer & merchant
+    // Save checkout pipeline states to order rows and shoot alert messages to merchant
     if (session.step === "CONFIRM_ORDER") {
-        if (msgText.toUpperCase() === "YES") {
+        if (msgText && msgText.toUpperCase() === "YES") {
             const item = session.pendingOrder;
-            
             await supabase.from('orders').insert([{
                 owner_phone: session.targetOwner,
                 customer_phone: from,
                 items: item,
                 total_amount: item.price
             }]);
-
             await sendWhatsAppMessage(from, session.lang === "hi" ? "🎉 आपका ऑर्डर प्लेस हो गया है!" : "🎉 Order placed successfully!");
             
             const ownerAlert = `🚨 *New Order Received!* 🚨\n\n👤 Customer: +${from}\n📦 Product: ${item.name}\n💰 Price: ₹${item.price}\n\n📱 To look at all incoming orders, reply with *ORDERS*.`;
