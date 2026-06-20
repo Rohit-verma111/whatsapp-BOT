@@ -23,7 +23,7 @@ const sessions = {};
 // Function to send WhatsApp text messages via Meta Cloud API
 async function sendWhatsAppMessage(toNumber, textBody) {
     try {
-        await axios.post(`https://graph.facebook.com/v17.0/${PHONE_ID}/messages`, {
+        await axios.post(`https://graph.facebook.com/v20.0/${PHONE_ID}/messages`, {
             messaging_product: "whatsapp",
             to: toNumber,
             type: "text",
@@ -36,15 +36,18 @@ async function sendWhatsAppMessage(toNumber, textBody) {
     }
 }
 
-// 🛠️ UPDATED: Fixed URL path issue for Meta Media Download
+// 🛠️ FIX: Bulletproof Meta Media Download Function
 async function downloadWhatsAppMedia(mediaId, localPath) {
     try {
-        // डायरेक्ट मीडिया आईडी वाले एंडपॉइंट पर हिट मारेंगे (बिना v17.0 के, क्योंकि ये सीधे आईडी से फेच करता है)
-        const resUrl = await axios.get(`https://graph.facebook.com/${mediaId}`, {
+        // 1. सबसे पहले मेटा से फाइल का असली डाउनलोड URL लाते हैं (वर्जन v20.0 के साथ)
+        const resUrl = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, {
             headers: { 'Authorization': `Bearer ${META_TOKEN}` }
         });
         
         const downloadUrl = resUrl.data.url;
+        if (!downloadUrl) throw new Error("Could not retrieve download URL from Meta.");
+
+        // 2. उस URL का उपयोग करके फाइल को डाउनलोड करते हैं
         const response = await axios({
             method: 'GET',
             url: downloadUrl,
@@ -202,7 +205,7 @@ app.post('/webhook', async (req, res) => {
             const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
             
             try {
-                // Download file
+                // Download file via new url pattern
                 await downloadWhatsAppMedia(document.id, tempFilePath);
 
                 const workbook = XLSX.readFile(tempFilePath);
@@ -295,7 +298,7 @@ app.post('/webhook', async (req, res) => {
             products?.forEach(p => {
                 catalogText += `🔹 Code: *${p.unique_code}* | ${p.name} (${p.weight}) - ₹${p.price}\n`;
             });
-            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो破解क्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
+            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो प्रोडक्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
             await sendWhatsAppMessage(from, catalogText);
         } else {
             await sendWhatsAppMessage(from, session.lang === "hi" ? "🔄 ओनर आपसे जल्द संपर्क करेंगे।" : "🔄 Owner will contact you soon.");
