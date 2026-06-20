@@ -144,7 +144,7 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
     const body = req.body;
 
-    // 🚨 DEBUG LINE: This prints every incoming payload from Meta to Render logs
+    // 🚨 DEBUG LINE: Logs every single incoming event from Meta
     console.log("📥 Raw Webhook Received:", JSON.stringify(body));
 
     if (!body.entry?.[0]?.changes?.[0]?.value?.messages) return;
@@ -184,58 +184,62 @@ app.post('/webhook', async (req, res) => {
         if (document) {
             console.log("📄 Document object detected:", JSON.stringify(document));
             
-            if (document.filename.endsWith(".xlsx") || document.mime_type.includes("sheet") || document.mime_type.includes("excel")) {
-                await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
+            // Loose Check: If it's a document, we process it as a potential excel file
+            await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
+            
+            const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
+            await downloadWhatsAppMedia(document.id, tempFilePath);
+
+            try {
+                const workbook = XLSX.readFile(tempFilePath);
+                const sheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[sheetName];
                 
-                const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
-                await downloadWhatsAppMedia(document.id, tempFilePath);
+                // Read rows converting array structures from Excel grid map
+                const rawData = XLSX.utils.sheet_to_json(worksheet, { range: 2 });
+                console.log("📊 Raw Rows Extracted from Excel:", rawData.length);
+                const parsedProducts = [];
 
-                try {
-                    const workbook = XLSX.readFile(tempFilePath);
-                    const sheetName = workbook.SheetNames[0];
-                    const worksheet = workbook.Sheets[sheetName];
-                    
-                    const rawData = XLSX.utils.sheet_to_json(worksheet, { range: 2 });
-                    const parsedProducts = [];
+                rawData.forEach(row => {
+                    const uniqueCode = row['Unique Code'] || Object.values(row)[0];
+                    const pName = row['Product Name'] || Object.values(row)[1];
+                    const weight = row['Weight/Quantity'] || Object.values(row)[2];
+                    const priceRaw = row['Price (₹)'] || Object.values(row)[3];
+                    const price = parseFloat(String(priceRaw).replace(/[^0-9.]/g, ''));
 
-                    rawData.forEach(row => {
-                        const uniqueCode = row['Unique Code'] || Object.values(row)[0];
-                        const pName = row['Product Name'] || Object.values(row)[1];
-                        const weight = row['Weight/Quantity'] || Object.values(row)[2];
-                        const price = parseFloat(row['Price (₹)'] || Object.values(row)[3]);
-
-                        if (uniqueCode && pName && price) {
-                            parsedProducts.push({
-                                owner_phone: from,
-                                unique_code: String(uniqueCode).trim().toUpperCase(),
-                                name: String(pName).trim(),
-                                weight: String(weight || "N/A").trim(),
-                                price: price
-                            });
-                        }
-                    });
-
-                    if (parsedProducts.length === 0) {
-                        await sendWhatsAppMessage(from, "❌ Excel parsing failed. No valid products found inside the template formatting.");
-                        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-                        return;
+                    if (uniqueCode && pName && !isNaN(price)) {
+                        parsedProducts.push({
+                            owner_phone: from,
+                            unique_code: String(uniqueCode).trim().toUpperCase(),
+                            name: String(pName).trim(),
+                            weight: String(weight || "N/A").trim(),
+                            price: price
+                        });
                     }
+                });
 
-                    await supabase.from('products').delete().eq('owner_phone', from);
-                    await supabase.from('products').insert(parsedProducts);
-
-                    generatePDF(session.shopName || checkStore.shop_name, parsedProducts, async (filePath, filename) => {
-                        await sendWhatsAppMessage(from, `✅ *Bulk Upload Successful!*\n\n🚀 Loaded *${parsedProducts.length}* items into your live digital store.\n\nYou can text *ORDERS* at any time to monitor customer purchases.`);
-                        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); 
-                    });
-
-                } catch (excelErr) {
-                    console.error("Excel Error:", excelErr);
-                    await sendWhatsAppMessage(from, "❌ Processing Error. Please verify your Excel structure follows the proper template layout.");
+                if (parsedProducts.length === 0) {
+                    await sendWhatsAppMessage(from, "❌ Excel parsing failed. Could not read data rows. Please use the exact template layout.");
                     if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+                    return;
                 }
-            } else {
-                await sendWhatsAppMessage(from, "❌ Unsupported file format! Please send a valid Excel (.xlsx) file.");
+
+                // Delete older products to prevent duplicate entries
+                await supabase.from('products').delete().eq('owner_phone', from);
+                
+                // Bulk Insert newly parsed products
+                const { error: insertErr } = await supabase.from('products').insert(parsedProducts);
+                if (insertErr) throw insertErr;
+
+                generatePDF(session.shopName || checkStore.shop_name, parsedProducts, async (filePath, filename) => {
+                    await sendWhatsAppMessage(from, `✅ *Bulk Upload Successful!*\n\n🚀 Loaded *${parsedProducts.length}* items into your live digital store.\n\nYou can text *ORDERS* at any time to monitor customer purchases.`);
+                    if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); 
+                });
+
+            } catch (excelErr) {
+                console.error("❌ Detailed Excel Error:", excelErr.message);
+                await sendWhatsAppMessage(from, `❌ System Error during processing: ${excelErr.message}`);
+                if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
             }
             return;
         }
