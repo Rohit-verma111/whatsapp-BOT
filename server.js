@@ -36,12 +36,21 @@ async function sendWhatsAppMessage(toNumber, textBody) {
     }
 }
 
-// 🛠️ ULTIMATE FIX: Direct URL Media Download Function (No manual paths)
-async function downloadWhatsAppMedia(mediaUrl, localPath) {
+// 🛠️ FINAL REWRITTEN DOWNLOAD FUNCTION (मेटा के नियमों के अनुसार एकदम सही तरीका)
+async function downloadWhatsAppMedia(mediaId, localPath) {
     try {
+        // स्टेप 1: पहले मीडिया आईडी की डिटेल्स निकालो (इसमें वर्जन जरूरी है)
+        const resDetails = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, {
+            headers: { 'Authorization': `Bearer ${META_TOKEN}` }
+        });
+        
+        const downloadUrl = resDetails.data.url;
+        if (!downloadUrl) throw new Error("Meta database did not return a download URL.");
+
+        // स्टेप 2: मिले हुए डाउनलोड लिंक पर हिट मारो (इस रिक्वेस्ट में कोई मैन्युअल पाथ नहीं जोड़ना है)
         const response = await axios({
             method: 'GET',
-            url: mediaUrl,
+            url: downloadUrl,
             responseType: 'stream',
             headers: { 'Authorization': `Bearer ${META_TOKEN}` }
         });
@@ -53,7 +62,7 @@ async function downloadWhatsAppMedia(mediaUrl, localPath) {
             writer.on('error', reject);
         });
     } catch (err) {
-        console.error("❌ Failed downloading media:", err.response ? err.response.data : err.message);
+        console.error("❌ Media Download Error:", err.response ? err.response.data : err.message);
         throw new Error(err.response ? JSON.stringify(err.response.data) : err.message);
     }
 }
@@ -196,8 +205,8 @@ app.post('/webhook', async (req, res) => {
             const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
             
             try {
-                // 🛠️ FIX: पासिंग द डायरेक्ट यूआरएल फ्रॉम मेटा वेबहुक पेलोड
-                await downloadWhatsAppMedia(document.url, tempFilePath);
+                // 🛠️ पासिंग द डॉक्यूमेंट आईडी टू डाउनलोड (दिस इस द राइट वे)
+                await downloadWhatsAppMedia(document.id, tempFilePath);
 
                 const workbook = XLSX.readFile(tempFilePath);
                 const sheetName = workbook.SheetNames[0];
