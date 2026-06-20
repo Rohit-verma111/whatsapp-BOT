@@ -36,12 +36,14 @@ async function sendWhatsAppMessage(toNumber, textBody) {
     }
 }
 
-// Function to download incoming media files from Meta servers
+// 🛠️ UPDATED: Fixed URL path issue for Meta Media Download
 async function downloadWhatsAppMedia(mediaId, localPath) {
     try {
-        const resUrl = await axios.get(`https://graph.facebook.com/v17.0/${mediaId}`, {
+        // डायरेक्ट मीडिया आईडी वाले एंडपॉइंट पर हिट मारेंगे (बिना v17.0 के, क्योंकि ये सीधे आईडी से फेच करता है)
+        const resUrl = await axios.get(`https://graph.facebook.com/${mediaId}`, {
             headers: { 'Authorization': `Bearer ${META_TOKEN}` }
         });
+        
         const downloadUrl = resUrl.data.url;
         const response = await axios({
             method: 'GET',
@@ -49,6 +51,7 @@ async function downloadWhatsAppMedia(mediaId, localPath) {
             responseType: 'stream',
             headers: { 'Authorization': `Bearer ${META_TOKEN}` }
         });
+        
         return new Promise((resolve, reject) => {
             const writer = fs.createWriteStream(localPath);
             response.data.pipe(writer);
@@ -56,7 +59,8 @@ async function downloadWhatsAppMedia(mediaId, localPath) {
             writer.on('error', reject);
         });
     } catch (err) {
-        console.error("❌ Failed downloading media:", err.message);
+        console.error("❌ Failed downloading media:", err.response ? err.response.data : err.message);
+        throw new Error(err.response ? JSON.stringify(err.response.data) : err.message);
     }
 }
 
@@ -143,7 +147,6 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
     const body = req.body;
 
-    // 🚨 DEBUG LINE: Logs every single incoming event from Meta
     console.log("📥 Raw Webhook Received:", JSON.stringify(body));
 
     if (!body.entry?.[0]?.changes?.[0]?.value?.messages) return;
@@ -153,7 +156,6 @@ app.post('/webhook', async (req, res) => {
     const msgText = message.text?.body?.trim();
     const document = message.document; 
 
-    // 🚨 SUPER BYPASS: सीधे तुम्हारा नंबर डिटेक्ट करके ओनर मान लेते हैं ताकि सुपबेस हैंग न हो
     let isOwner = (from === "919667805579"); 
     let checkStore = null;
 
@@ -169,7 +171,7 @@ app.post('/webhook', async (req, res) => {
             checkStore = storeData;
         }
     } catch (dbErr) {
-        console.error("⚠️ Supabase Fetch Error (Bypassed):", dbErr.message);
+        console.error("⚠️ Supabase Fetch Error:", dbErr.message);
     }
 
     if (!sessions[from]) sessions[from] = { step: "START" };
@@ -177,7 +179,6 @@ app.post('/webhook', async (req, res) => {
 
     // ================= 🏪 MULTI-OWNER MERCHANT FLOW =================
     if (isOwner) {
-        // Handle new shop registration command
         if (msgText && msgText.toUpperCase().startsWith("SHOP:")) {
             const shopName = msgText.split(":")[1].trim();
             await supabase.from('stores').upsert({ owner_phone: from, shop_name: shopName });
@@ -187,23 +188,23 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
-        // Handle dashboard view link requested by merchant
         if (msgText && (msgText.toUpperCase() === "ORDERS" || msgText === "ऑर्डर")) {
             const dashboardLink = `https://${req.headers.host}/dashboard/${from}`;
             await sendWhatsAppMessage(from, `📋 To view all live incoming orders for your store, open this link on your phone:\n\n🔗 ${dashboardLink}`);
             return;
         }
 
-        // Process document attachments (Excel sheet parser)
         if (document) {
             console.log("📄 Document received! Filename:", document.filename, "Mime:", document.mime_type);
             
             await sendWhatsAppMessage(from, "📥 Processing your Excel catalog, please wait...");
             
             const tempFilePath = path.join(__dirname, `bulk_${Date.now()}.xlsx`);
-            await downloadWhatsAppMedia(document.id, tempFilePath);
-
+            
             try {
+                // Download file
+                await downloadWhatsAppMedia(document.id, tempFilePath);
+
                 const workbook = XLSX.readFile(tempFilePath);
                 const sheetName = workbook.SheetNames[0];
                 const worksheet = workbook.Sheets[sheetName];
@@ -236,10 +237,8 @@ app.post('/webhook', async (req, res) => {
                     return;
                 }
 
-                // Delete older products
                 await supabase.from('products').delete().eq('owner_phone', from);
                 
-                // Bulk Insert
                 const { error: insertErr } = await supabase.from('products').insert(parsedProducts);
                 if (insertErr) throw insertErr;
 
@@ -292,11 +291,11 @@ app.post('/webhook', async (req, res) => {
             session.step = "ENTER_CODE";
             const { data: products } = await supabase.from('products').select('*').eq('owner_phone', session.targetOwner);
             
-            let catalogText = session.lang === "hi" ? "📋 उपलब्ध बीएसटीसी सूची:\n\n" : "📋 Available Products List:\n\n";
+            let catalogText = session.lang === "hi" ? "📋 उपलब्ध प्रोडक्ट्स की सूची:\n\n" : "📋 Available Products List:\n\n";
             products?.forEach(p => {
                 catalogText += `🔹 Code: *${p.unique_code}* | ${p.name} (${p.weight}) - ₹${p.price}\n`;
             });
-            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो प्रोडक्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
+            catalogText += session.lang === "hi" ? "\n🛒 कृपया जो破解क्ट खरीदना है उसका **Unique Code** लिखकर भेजें।" : "\n🛒 Please reply with the **Unique Code** of the product.";
             await sendWhatsAppMessage(from, catalogText);
         } else {
             await sendWhatsAppMessage(from, session.lang === "hi" ? "🔄 ओनर आपसे जल्द संपर्क करेंगे।" : "🔄 Owner will contact you soon.");
